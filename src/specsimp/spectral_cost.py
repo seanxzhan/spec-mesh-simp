@@ -1,68 +1,247 @@
 """Spectral cost function for mesh simplification (Lescoat et al. 2020, Eq. 2).
 
-The cost measures how much an edge collapse disturbs the first K eigenvectors
-of the Laplacian. It's defined as:
+The cost measures how much an edge collapse disturbs the first K eigenvectors.
 
     E = ||PZ - M_tilde^{-1} L_tilde P F||^2_{M_tilde}
 
-where F = first K eigenvectors, Z = M^{-1} L F = F * Lambda.
+Decomposes per-vertex: E = sum_v E_v, only the 2-ring changes per collapse.
 
-The key insight: this decomposes per-vertex as E = sum_v E_v, and only the
-2-ring of a collapse is affected — so edge costs can be evaluated locally.
+This module simulates the topology change WITHOUT mutating the adjacency:
+it figures out which faces disappear and which get v→u substitution, then
+computes post-collapse cotangent weights and masses directly from geometry.
 """
 from __future__ import annotations
 
 import numpy as np
-from scipy import sparse
-
-from specsimp.mesh import TriMesh
 from specsimp.adjacency import MeshAdjacency
-from specsimp.laplacian import cotangent_laplacian
 
 
 def precompute_spectral_signals(
     eigenvectors: np.ndarray, eigenvalues: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Precompute F and Z for spectral cost evaluation.
-
-    F = eigenvectors (n, K)
-    Z = F * Lambda = M^{-1} L F (since L F = M F Lambda)
-
-    These are restricted via Q after each collapse.
-    """
+    """F = eigenvectors, Z = F * Lambda."""
     F = eigenvectors.copy()
     Z = F * eigenvalues[np.newaxis, :]
     return F, Z
 
 
-def compute_total_spectral_energy(
-    mesh: TriMesh, F: np.ndarray, Z: np.ndarray
+# ---------------------------------------------------------------------------
+# Local geometry helpers (read-only on adj)
+# ---------------------------------------------------------------------------
+
+def _edge_cotangent_weight(adj: MeshAdjacency, u: int, v: int) -> float:
+    """Cotangent weight w_uv = 0.5 * sum of cot(opposite angles)."""
+    key = (min(u, v), max(u, v))
+    faces = adj.edge_faces.get(key, set())
+    w = 0.0
+    for fi in faces:
+        if adj._deleted_faces[fi]:
+            continue
+        face = adj.faces[fi]
+        for k in range(3):
+            vi = int(face[k])
+            if vi != u and vi != v:
+                opposite = vi
+                break
+        else:
+            continue
+        e1 = adj.vertices[u] - adj.vertices[opposite]
+        e2 = adj.vertices[v] - adj.vertices[opposite]
+        dot = np.dot(e1, e2)
+        cross_mag = np.linalg.norm(np.cross(e1, e2))
+        if cross_mag > 1e-30:
+            w += 0.5 * dot / cross_mag
+    return w
+
+
+def _vertex_mass(adj: MeshAdjacency, v: int) -> float:
+    """Lumped mass = 1/3 of incident face areas."""
+    mass = 0.0
+    for fi in adj.vert_faces[v]:
+        if adj._deleted_faces[fi]:
+            continue
+        a, b, c = int(adj.faces[fi, 0]), int(adj.faces[fi, 1]), int(adj.faces[fi, 2])
+        e1 = adj.vertices[b] - adj.vertices[a]
+        e2 = adj.vertices[c] - adj.vertices[a]
+        mass += np.linalg.norm(np.cross(e1, e2)) / 6.0
+    return mass
+
+
+def _local_vertex_energy(
+    adj: MeshAdjacency, v: int, F: np.ndarray, Z: np.ndarray, remap: np.ndarray
 ) -> float:
-    """Compute E = ||Z - M^{-1} L F||^2_M over all vertices.
+    """E_v = M_v * ||Z_v - (M^{-1}LF)_v||^2 from local geometry."""
+    vi = remap[v]
+    if vi < 0:
+        return 0.0
+    mass_v = _vertex_mass(adj, v)
+    if mass_v < 1e-30:
+        return 0.0
+    LF_v = np.zeros(F.shape[1])
+    for nb in adj.vert_neighbors[v]:
+        if adj._deleted_verts[nb]:
+            continue
+        nb_i = remap[nb]
+        if nb_i < 0:
+            continue
+        w = _edge_cotangent_weight(adj, v, nb)
+        LF_v += w * (F[vi] - F[nb_i])
+    residual = Z[vi] - LF_v / mass_v
+    return mass_v * float(np.dot(residual, residual))
 
-    When F and Z are from the original mesh and no collapses have occurred,
-    this is zero. After collapses (F, Z restricted but L, M recomputed from
-    the actual mesh), it measures total spectral distortion.
+
+# ---------------------------------------------------------------------------
+# Post-collapse simulation helpers (READ-ONLY on adj, simulate topology)
+# ---------------------------------------------------------------------------
+
+def _simulate_collapse_topology(
+    adj: MeshAdjacency, u: int, v: int
+) -> tuple[set[int], dict[int, tuple[int, int, int]]]:
+    """Figure out post-collapse topology without mutating adj.
+
+    Returns:
+        deleted_faces: set of face indices that would be removed
+        remapped_faces: dict fi -> (a, b, c) giving the face vertices after
+                        substituting v->u (only for faces that survive)
     """
-    L, M = cotangent_laplacian(mesh)
-    M_diag = M.diagonal()
-    M_inv_LF = sparse.diags(1.0 / M_diag) @ L @ F
-    residual = Z - M_inv_LF  # (n, K)
-    # E = sum_v M_v * ||row_v(residual)||^2
-    return float(np.sum(M_diag[:, np.newaxis] * residual ** 2))
+    key_uv = (min(u, v), max(u, v))
+    shared_faces = set()
+    for fi in adj.edge_faces.get(key_uv, set()):
+        if not adj._deleted_faces[fi]:
+            shared_faces.add(fi)
+
+    remapped_faces = {}
+    for fi in adj.vert_faces[v]:
+        if adj._deleted_faces[fi]:
+            continue
+        if fi in shared_faces:
+            continue
+        face = adj.faces[fi]
+        new_face = tuple(u if int(face[k]) == v else int(face[k]) for k in range(3))
+        remapped_faces[fi] = new_face
+
+    return shared_faces, remapped_faces
 
 
-def compute_per_vertex_energy(
-    L: sparse.spmatrix, M: sparse.spmatrix, F: np.ndarray, Z: np.ndarray
-) -> np.ndarray:
-    """Compute per-vertex spectral energy E_v = M_v * ||row_v(Z - M^{-1}LF)||^2.
+def _post_collapse_neighbors(adj: MeshAdjacency, u: int, v: int) -> set[int]:
+    """Neighbors of u after collapse (u absorbs v's neighbors)."""
+    return (adj.vert_neighbors[u] | adj.vert_neighbors[v]) - {u, v}
 
-    Returns array of shape (n,).
+
+def _post_collapse_faces_for_vertex(
+    adj: MeshAdjacency, w: int, u: int, v: int,
+    deleted_faces: set[int], remapped_faces: dict[int, tuple[int, int, int]]
+) -> list[tuple[int, int, int]]:
+    """Get the face triplets incident to vertex w after collapse of (u,v)->u."""
+    result = []
+    # w's original faces (minus deleted, with v->u substitution)
+    for fi in adj.vert_faces[w]:
+        if adj._deleted_faces[fi] or fi in deleted_faces:
+            continue
+        if fi in remapped_faces:
+            face = remapped_faces[fi]
+        else:
+            face = (int(adj.faces[fi, 0]), int(adj.faces[fi, 1]), int(adj.faces[fi, 2]))
+        if w in face or (w == u and u in face):
+            result.append(face)
+
+    # If w == u, also pick up v's surviving faces (already remapped)
+    if w == u:
+        for fi, face in remapped_faces.items():
+            if fi not in adj.vert_faces[u] and u in face:
+                result.append(face)
+
+    return result
+
+
+def _cot_weight_from_positions(pu: np.ndarray, pv: np.ndarray, po: np.ndarray) -> float:
+    """Cotangent of angle at po in triangle (pu, pv, po), times 0.5."""
+    e1 = pu - po
+    e2 = pv - po
+    dot = np.dot(e1, e2)
+    cross_mag = np.linalg.norm(np.cross(e1, e2))
+    if cross_mag > 1e-30:
+        return 0.5 * dot / cross_mag
+    return 0.0
+
+
+def _post_collapse_vertex_energy(
+    adj: MeshAdjacency, w: int, u: int, v: int, alpha: float,
+    new_pos: np.ndarray,
+    deleted_faces: set[int], remapped_faces: dict[int, tuple[int, int, int]],
+    post_neighbors_w: set[int],
+    F_after: np.ndarray, Z_after: np.ndarray, remap_after: np.ndarray,
+) -> float:
+    """Compute E_w after collapse of (u,v)->u at new_pos, without mutating adj.
+
+    We compute the mass and Laplacian row for w using the post-collapse face geometry.
     """
-    M_diag = M.diagonal()
-    M_inv_LF = sparse.diags(1.0 / M_diag) @ L @ F
-    residual = Z - M_inv_LF
-    return M_diag * np.sum(residual ** 2, axis=1)
+    wi = remap_after[w]
+    if wi < 0:
+        return 0.0
+
+    # Get post-collapse faces incident to w
+    faces_w = _post_collapse_faces_for_vertex(adj, w, u, v, deleted_faces, remapped_faces)
+
+    # Compute mass_w from these faces
+    mass_w = 0.0
+    for (a, b, c) in faces_w:
+        pa = new_pos if a == u else adj.vertices[a]
+        pb = new_pos if b == u else adj.vertices[b]
+        pc = new_pos if c == u else adj.vertices[c]
+        e1 = pb - pa
+        e2 = pc - pa
+        mass_w += np.linalg.norm(np.cross(e1, e2)) / 6.0
+
+    if mass_w < 1e-30:
+        return 0.0
+
+    # Compute (LF)_w = sum_nb w_wn * (F_w - F_nb)
+    # We need cotangent weights for each edge (w, nb) in the post-collapse mesh
+    LF_w = np.zeros(F_after.shape[1])
+
+    for nb in post_neighbors_w:
+        if nb == v:
+            continue
+        nb_i = remap_after[nb]
+        if nb_i < 0:
+            continue
+
+        # Cotangent weight for edge (w, nb) from faces containing both w and nb
+        w_edge = 0.0
+        for (a, b, c) in faces_w:
+            # Check if this face contains both w and nb
+            face_set = {a, b, c}
+            if w in face_set and nb in face_set:
+                # Opposite vertex is the third one
+                opposite = (face_set - {w, nb}).pop()
+                po = new_pos if opposite == u else adj.vertices[opposite]
+                pw = new_pos if w == u else adj.vertices[w]
+                pn = new_pos if nb == u else adj.vertices[nb]
+                w_edge += _cot_weight_from_positions(pw, pn, po)
+
+        LF_w += w_edge * (F_after[wi] - F_after[nb_i])
+
+    residual = Z_after[wi] - LF_w / mass_w
+    return mass_w * float(np.dot(residual, residual))
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def compute_per_vertex_energies(
+    adj: MeshAdjacency, F: np.ndarray, Z: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute all per-vertex energies and active remap."""
+    active = np.where(~adj._deleted_verts)[0]
+    n_active = len(active)
+    remap = np.full(len(adj.vertices), -1, dtype=np.int64)
+    remap[active] = np.arange(n_active)
+    energies = np.zeros(n_active)
+    for v in active:
+        energies[remap[v]] = _local_vertex_energy(adj, v, F, Z, remap)
+    return energies, remap
 
 
 def compute_edge_spectral_cost(
@@ -72,109 +251,72 @@ def compute_edge_spectral_cost(
     alpha: float,
     F: np.ndarray,
     Z: np.ndarray,
+    energies: np.ndarray,
+    remap: np.ndarray,
 ) -> float:
-    """Compute spectral cost of collapsing edge (u,v) at position alpha.
+    """Compute spectral cost of collapsing (u,v) at alpha WITHOUT mutating adj.
 
-    cost(e) = E_after - E_before for vertices in H = {u,v} ∪ N1(u,v).
-
-    This simulates the collapse on a temporary copy to get E_after.
+    Simulates the topology change (which faces disappear, which get v→u)
+    and computes post-collapse energies from geometry directly.
     """
-    import copy
-
-    # Affected set H
+    # Affected set H (vertices whose Laplacian row changes)
     H = {u, v} | adj.vert_neighbors[u] | adj.vert_neighbors[v]
-    H = {w for w in H if adj.is_valid_vertex(w)}
+    H = {w for w in H if not adj._deleted_verts[w]}
 
-    # Build current mesh and compute E_before for H
-    mesh_before = adj.to_trimesh()
-    L_before, M_before = cotangent_laplacian(mesh_before)
-    ev_before = compute_per_vertex_energy(L_before, M_before, F, Z)
+    # E_before
+    e_before = sum(energies[remap[w]] for w in H if remap[w] >= 0)
 
-    # Map from adj vertex indices to local mesh indices
-    active = np.where(~adj._deleted_verts)[0]
-    remap = np.full(len(adj.vertices), -1, dtype=np.int64)
-    remap[active] = np.arange(len(active))
-
-    e_before = sum(ev_before[remap[w]] for w in H if remap[w] >= 0)
-
-    # Simulate collapse
-    adj_copy = copy.deepcopy(adj)
+    # Simulate topology
     new_pos = (1 - alpha) * adj.vertices[u] + alpha * adj.vertices[v]
+    deleted_faces, remapped_faces = _simulate_collapse_topology(adj, u, v)
 
-    # Build restriction Q
-    n_active = len(active)
-    u_local = int(remap[u])
-    v_local = int(remap[v])
+    # Build F_after, Z_after (restrict: remove v's row, blend into u's row)
+    vi_local = int(remap[v])
+    ui_local = int(remap[u])
+    if vi_local >= 0:
+        F_after = np.delete(F, vi_local, axis=0)
+        Z_after = np.delete(Z, vi_local, axis=0)
+        ui_after = ui_local if ui_local < vi_local else ui_local - 1
+        F_after[ui_after] = (1 - alpha) * F[ui_local] + alpha * F[vi_local]
+        Z_after[ui_after] = (1 - alpha) * Z[ui_local] + alpha * Z[vi_local]
+    else:
+        F_after = F.copy()
+        Z_after = Z.copy()
+        ui_after = ui_local
 
-    keep = [i for i in range(n_active) if i != v_local]
-    n_out = len(keep)
-    new_idx = np.full(n_active, -1, dtype=np.int64)
-    for new_i, old_i in enumerate(keep):
-        new_idx[old_i] = new_i
+    # Build remap_after (v removed)
+    active_after = [i for i in np.where(~adj._deleted_verts)[0] if i != v]
+    n_active_after = len(active_after)
+    remap_after = np.full(len(adj.vertices), -1, dtype=np.int64)
+    for new_i, old_i in enumerate(active_after):
+        remap_after[old_i] = new_i
 
-    q_rows, q_cols, q_vals = [], [], []
-    for old_i in keep:
-        new_i = new_idx[old_i]
-        if old_i == u_local:
-            q_rows.extend([new_i, new_i])
-            q_cols.extend([u_local, v_local])
-            q_vals.extend([1.0 - alpha, alpha])
+    # Post-collapse neighbors for each vertex in H
+    post_neighbors_u = _post_collapse_neighbors(adj, u, v)
+
+    # Compute E_after for H \ {v}
+    H_after = H - {v}
+    e_after = 0.0
+    for w in H_after:
+        # Post-collapse neighbors of w
+        if w == u:
+            post_nb_w = post_neighbors_u
         else:
-            q_rows.append(new_i)
-            q_cols.append(old_i)
-            q_vals.append(1.0)
-    Q = sparse.csc_matrix((q_vals, (q_rows, q_cols)), shape=(n_out, n_active))
+            # w's neighbors, with v replaced by u
+            post_nb_w = set()
+            for nb in adj.vert_neighbors[w]:
+                if adj._deleted_verts[nb] and nb != v:
+                    continue
+                if nb == v:
+                    post_nb_w.add(u)
+                else:
+                    post_nb_w.add(nb)
+            post_nb_w.discard(w)
 
-    F_after = Q @ F
-    Z_after = Q @ Z
-
-    # Collapse on the copy
-    adj_copy.collapse_edge(u, v, new_pos)
-    mesh_after = adj_copy.to_trimesh()
-    L_after, M_after = cotangent_laplacian(mesh_after)
-    ev_after = compute_per_vertex_energy(L_after, M_after, F_after, Z_after)
-
-    # Map H to post-collapse indices
-    active_after = np.where(~adj_copy._deleted_verts)[0]
-    remap_after = np.full(len(adj_copy.vertices), -1, dtype=np.int64)
-    remap_after[active_after] = np.arange(len(active_after))
-
-    H_after = (H - {v}) | {u}
-    e_after = sum(ev_after[remap_after[w]] for w in H_after if remap_after[w] >= 0)
+        e_after += _post_collapse_vertex_energy(
+            adj, w, u, v, alpha, new_pos,
+            deleted_faces, remapped_faces, post_nb_w,
+            F_after, Z_after, remap_after,
+        )
 
     return e_after - e_before
-
-
-def find_optimal_alpha_spectral(
-    adj: MeshAdjacency, u: int, v: int, F: np.ndarray, Z: np.ndarray
-) -> tuple[float, float]:
-    """Find optimal alpha via 1D quadratic fit (paper Section 3.4).
-
-    Evaluates cost at alpha = 0, 0.5, 1, fits a parabola, returns (cost, alpha*).
-    """
-    c0 = compute_edge_spectral_cost(adj, u, v, 0.0, F, Z)
-    c5 = compute_edge_spectral_cost(adj, u, v, 0.5, F, Z)
-    c1 = compute_edge_spectral_cost(adj, u, v, 1.0, F, Z)
-
-    # Fit quadratic p(alpha) = a*alpha^2 + b*alpha + c
-    # p(0) = c0, p(0.5) = c5, p(1) = c1
-    a = 2.0 * (c1 + c0 - 2.0 * c5)
-    b = c1 - c0 - a
-
-    if abs(a) < 1e-15:
-        costs = [c0, c5, c1]
-        alphas = [0.0, 0.5, 1.0]
-        best_idx = int(np.argmin(costs))
-        return costs[best_idx], alphas[best_idx]
-
-    alpha_star = float(np.clip(-b / (2.0 * a), 0.0, 1.0))
-    cost_star = compute_edge_spectral_cost(adj, u, v, alpha_star, F, Z)
-
-    best_cost = min(c0, c5, c1, cost_star)
-    if best_cost == cost_star:
-        return cost_star, alpha_star
-    elif best_cost == c0:
-        return c0, 0.0
-    elif best_cost == c1:
-        return c1, 1.0
-    return c5, 0.5

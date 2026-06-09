@@ -165,4 +165,8 @@ class MeshAdjacency:
         remap[active_v] = np.arange(len(active_v))
         new_verts = self.vertices[active_v]
         new_faces = remap[self.faces[active_f]]
+        # Filter out any faces that reference deleted vertices (shouldn't happen
+        # but guards against adjacency corruption from temporary simulations)
+        valid = np.all(new_faces >= 0, axis=1)
+        new_faces = new_faces[valid]
         return TriMesh(vertices=new_verts, faces=new_faces)

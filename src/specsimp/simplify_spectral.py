@@ -15,8 +15,8 @@ from specsimp.laplacian import cotangent_laplacian
 from specsimp.eigen import compute_eigenpairs
 from specsimp.spectral_cost import (
     precompute_spectral_signals,
+    compute_per_vertex_energies,
     compute_edge_spectral_cost,
-    find_optimal_alpha_spectral,
 )
 
 
@@ -24,7 +24,7 @@ def simplify_spectral(
     mesh: TriMesh,
     target_verts: int,
     k: int = 30,
-    use_quadratic_fit: bool = True,
+    use_quadratic_fit: bool = False,
     verbose: bool = False,
 ) -> tuple[TriMesh, sparse.csc_matrix]:
     """Spectrum-preserving mesh simplification.
@@ -33,8 +33,8 @@ def simplify_spectral(
         mesh: Input triangle mesh
         target_verts: Target number of vertices
         k: Number of eigenvectors to preserve
-        use_quadratic_fit: If True, find optimal alpha via 1D quadratic fit.
-                          If False, use alpha=0.5 (midpoint) for speed.
+        use_quadratic_fit: If True, evaluate at alpha=0,0.5,1 and fit parabola.
+                          If False, use alpha=0.5 (faster).
         verbose: Print progress
 
     Returns:
@@ -48,6 +48,9 @@ def simplify_spectral(
     adj = MeshAdjacency(mesh)
     n = mesh.n_verts
     P = sparse.eye(n, format="csc")
+
+    # Compute initial per-vertex energies (should be ~0 since F,Z are consistent)
+    energies, remap = compute_per_vertex_energies(adj, F, Z)
 
     # Timestamp-based stale detection
     vertex_timestamps: dict[int, int] = {v: 0 for v in range(n)}
@@ -63,10 +66,20 @@ def simplify_spectral(
             return
 
         if use_quadratic_fit:
-            cost, alpha = find_optimal_alpha_spectral(adj, u, v, F, Z)
+            c0 = compute_edge_spectral_cost(adj, u, v, 0.0, F, Z, energies, remap)
+            c5 = compute_edge_spectral_cost(adj, u, v, 0.5, F, Z, energies, remap)
+            c1 = compute_edge_spectral_cost(adj, u, v, 1.0, F, Z, energies, remap)
+            # Fit parabola
+            a_coef = 2.0 * (c1 + c0 - 2.0 * c5)
+            b_coef = c1 - c0 - a_coef
+            if abs(a_coef) > 1e-15:
+                alpha = float(np.clip(-b_coef / (2.0 * a_coef), 0.0, 1.0))
+            else:
+                alpha = [0.0, 0.5, 1.0][int(np.argmin([c0, c5, c1]))]
+            cost = min(c0, c5, c1, compute_edge_spectral_cost(adj, u, v, alpha, F, Z, energies, remap))
         else:
             alpha = 0.5
-            cost = compute_edge_spectral_cost(adj, u, v, 0.5, F, Z)
+            cost = compute_edge_spectral_cost(adj, u, v, 0.5, F, Z, energies, remap)
 
         heapq.heappush(heap, (
             cost, counter, u, v, alpha,
@@ -78,11 +91,17 @@ def simplify_spectral(
         print(f"Setup: {n} verts, {k} eigenvectors")
         print("Computing initial edge costs...")
 
-    for u, v in adj.get_edges():
+    edges = adj.get_edges()
+    for ei, (u, v) in enumerate(edges):
         _push_edge(u, v)
-
+        if verbose and (ei + 1) % 50 == 0:
+            print(f"  edges: {ei+1}/{len(edges)}", end="\r")
     if verbose:
-        print(f"Simplifying {n} -> {target_verts} verts...")
+        print(f"  edges: {len(edges)}/{len(edges)}")
+
+    total_collapses = n - target_verts
+    if verbose:
+        print(f"Heap built ({len(heap)} entries). Simplifying {n} -> {target_verts} verts ({total_collapses} collapses)...")
 
     n_collapsed = 0
     while adj.n_active_verts > target_verts and heap:
@@ -99,10 +118,10 @@ def simplify_spectral(
         # Build restriction Q before collapse
         active = np.where(~adj._deleted_verts)[0]
         n_active = len(active)
-        remap = np.full(len(adj.vertices), -1, dtype=np.int64)
-        remap[active] = np.arange(n_active)
-        u_local = int(remap[u])
-        v_local = int(remap[v])
+        local_remap = np.full(len(adj.vertices), -1, dtype=np.int64)
+        local_remap[active] = np.arange(n_active)
+        u_local = int(local_remap[u])
+        v_local = int(local_remap[v])
 
         keep = [i for i in range(n_active) if i != v_local]
         n_out = len(keep)
@@ -133,6 +152,9 @@ def simplify_spectral(
         F = Q @ F
         Z = Q @ Z
 
+        # Recompute energies and remap for the new state
+        energies, remap = compute_per_vertex_energies(adj, F, Z)
+
         # Update timestamp
         current_ts += 1
         vertex_timestamps[u] = current_ts
@@ -144,10 +166,11 @@ def simplify_spectral(
             if adj.is_valid_vertex(nb):
                 _push_edge(u, nb)
 
-        if verbose and n_collapsed % 10 == 0:
-            print(f"  {n_collapsed} collapses, {adj.n_active_verts} verts remaining")
+        if verbose:
+            pct = 100 * n_collapsed / max(total_collapses, 1)
+            print(f"  [{pct:5.1f}%] {n_collapsed}/{total_collapses} collapses, {adj.n_active_verts} verts remaining", end="\r")
 
     if verbose:
-        print(f"Done: {n_collapsed} collapses, final {adj.n_active_verts} verts")
+        print(f"\n  Done: {n_collapsed} collapses, final {adj.n_active_verts} verts")
 
     return adj.to_trimesh(), P

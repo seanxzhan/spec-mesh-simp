@@ -53,7 +53,7 @@ def main():
 
     # QEM simplification
     t0 = time.time()
-    mesh_qem, P_qem = simplify_qem(mesh, target_verts=target, compute_restriction=True)
+    mesh_qem, P_qem = simplify_qem(mesh, target_verts=target, compute_restriction=True, use_line_quadric=False)
     dt_qem = time.time() - t0
     L_qem, M_qem = cotangent_laplacian(mesh_qem)
     vals_qem, vecs_qem = compute_eigenpairs(L_qem, M_qem, k=K)
@@ -68,7 +68,7 @@ def main():
 
     # Spectral simplification
     t0 = time.time()
-    mesh_spec, P_spec = simplify_spectral(mesh, target_verts=target, k=K, use_quadratic_fit=False)
+    mesh_spec, P_spec = simplify_spectral(mesh, target_verts=target, k=K, use_quadratic_fit=False, verbose=True)
     dt_spec = time.time() - t0
     L_spec, M_spec = cotangent_laplacian(mesh_spec)
     vals_spec, vecs_spec = compute_eigenpairs(L_spec, M_spec, k=K)
