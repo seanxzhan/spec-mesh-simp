@@ -65,6 +65,42 @@ def main():
         f"  Mean curvature (|Lx|): min={mean_curvature.min():.6f}, max={mean_curvature.max():.6f}"
     )
 
+    # Save matrix visualizations as PNGs
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from scipy.sparse.csgraph import reverse_cuthill_mckee
+
+    n = min(mesh.n_verts, 100)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Reverse Cuthill-McKee reordering gives L a banded structure
+    perm = reverse_cuthill_mckee(L)
+    n_show = n
+    L_block = L[perm[:n_show]][:, perm[:n_show]].toarray()
+    vmax = np.max(np.abs(L_block))
+    im0 = axes[0].imshow(L_block, cmap="RdBu_r", aspect="equal",
+                          vmin=-vmax, vmax=vmax)
+    axes[0].set_title(f"L ({n_show}×{n_show}, RCM reorder)\nred = diagonal (+), blue = off-diag (−)")
+    axes[0].set_xlabel("vertex j")
+    axes[0].set_ylabel("vertex i")
+    plt.colorbar(im0, ax=axes[0], shrink=0.8)
+
+    # Panel 2: M diagonal as bar plot
+    m_diag = M.diagonal()[:n]
+    axes[1].bar(range(n), m_diag, width=1.0, color="steelblue", edgecolor="none")
+    axes[1].set_title(f"M (mass) — diagonal ({n} vertices)\neach = 1/3 × incident face area")
+    axes[1].set_xlabel("vertex i")
+    axes[1].set_ylabel("area")
+    axes[1].set_xlim(0, n)
+
+    plt.tight_layout()
+    out_path = "out/01_laplacian_matrices.png"
+    plt.savefig(out_path, dpi=150)
+    print(f"  Saved: {out_path}")
+    plt.close()
+
     if args.smoke:
         assert L.shape == (mesh.n_verts, mesh.n_verts)
         row_sums = np.array(L.sum(axis=1)).ravel()
