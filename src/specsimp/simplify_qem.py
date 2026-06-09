@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import numpy as np
+from scipy import sparse
 
 from specsimp.mesh import TriMesh, face_areas as compute_face_areas
 from specsimp.adjacency import MeshAdjacency
@@ -14,8 +15,9 @@ def simplify_qem(
     use_optimal_position: bool = True,
     use_line_quadric: bool = True,
     line_quadric_weight: float = 1e-3,
+    compute_restriction: bool = False,
     verbose: bool = False,
-) -> TriMesh:
+) -> TriMesh | tuple[TriMesh, sparse.csc_matrix]:
     """Simplify a mesh using Quadric Error Metrics (Garland & Heckbert 1997).
 
     Args:
@@ -23,12 +25,22 @@ def simplify_qem(
         target_verts: Target number of vertices
         use_optimal_position: If True, use SVD to find optimal merge point.
                              If False, pick the better of the two endpoints.
+        compute_restriction: If True, also return the restriction matrix P
+            such that V_coarse ≈ P @ V_fine. P has non-negative entries with
+            rows summing to 1.
         verbose: Print progress
 
     Returns:
-        Simplified TriMesh
+        Simplified TriMesh (if compute_restriction=False)
+        (Simplified TriMesh, P) where P is (n_coarse, n_fine) restriction matrix
     """
     adj = MeshAdjacency(mesh)
+    n_fine = mesh.n_verts
+
+    # Restriction matrix P: accumulates as P = Q_n ... Q_2 Q_1
+    # Each Q_i is the elementary restriction for one collapse.
+    # Start with identity; will be updated each collapse.
+    P = sparse.eye(n_fine, format="csc") if compute_restriction else None
 
     # Compute face quadrics
     face_quadrics: dict[int, Quadric] = {}
@@ -114,6 +126,47 @@ def simplify_qem(
         if not adj.is_collapsible(u, v):
             continue
 
+        # Build restriction matrix Q for this collapse before modifying adjacency
+        if P is not None:
+            active = np.where(~adj._deleted_verts)[0]
+            n_active = len(active)
+            remap = np.full(len(adj.vertices), -1, dtype=np.int64)
+            remap[active] = np.arange(n_active)
+            u_local = int(remap[u])
+            v_local = int(remap[v])
+
+            # Compute alpha: how far along (u -> v) is the new position?
+            edge_vec = adj.vertices[v] - adj.vertices[u]
+            edge_len_sq = np.dot(edge_vec, edge_vec)
+            if edge_len_sq > 1e-30:
+                alpha = float(np.dot(pos - adj.vertices[u], edge_vec) / edge_len_sq)
+                alpha = np.clip(alpha, 0.0, 1.0)
+            else:
+                alpha = 0.5
+
+            # Q: (n_active-1) x n_active matrix
+            # All rows are identity except merged row which blends u and v
+            keep = [i for i in range(n_active) if i != v_local]
+            n_out = len(keep)
+            new_idx = np.full(n_active, -1, dtype=np.int64)
+            for new_i, old_i in enumerate(keep):
+                new_idx[old_i] = new_i
+
+            q_rows, q_cols, q_vals = [], [], []
+            for old_i in keep:
+                new_i = new_idx[old_i]
+                if old_i == u_local:
+                    q_rows.extend([new_i, new_i])
+                    q_cols.extend([u_local, v_local])
+                    q_vals.extend([1.0 - alpha, alpha])
+                else:
+                    q_rows.append(new_i)
+                    q_cols.append(old_i)
+                    q_vals.append(1.0)
+
+            Q = sparse.csc_matrix((q_vals, (q_rows, q_cols)), shape=(n_out, n_active))
+            P = Q @ P
+
         # Collapse: merge v into u at pos
         affected = adj.collapse_edge(u, v, pos)
         n_collapsed += 1
@@ -139,4 +192,7 @@ def simplify_qem(
     if verbose:
         print(f"Done: {n_collapsed} collapses, final {adj.n_active_verts} verts")
 
-    return adj.to_trimesh()
+    result = adj.to_trimesh()
+    if P is not None:
+        return result, P
+    return result

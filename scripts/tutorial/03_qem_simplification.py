@@ -77,6 +77,7 @@ def main():
         ps.init()
         ps.set_up_dir("y_up")
         ps.set_ground_plane_mode("none")
+        ps.set_front_dir("neg_z_front")
 
         # Show original
         ps.register_surface_mesh(
