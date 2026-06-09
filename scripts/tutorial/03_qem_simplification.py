@@ -24,11 +24,12 @@ from specsimp import colors
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mesh", default="data/spot.obj", help="Path to .obj mesh file")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--use-line-quadrics", action="store_true")
     args = parser.parse_args()
 
-    data_dir = Path(__file__).resolve().parents[2] / "data"
-    mesh = load_obj(str(data_dir / "spot.obj"))
+    mesh = load_obj(args.mesh)
 
     print("=== QEM Simplification ===")
     print(f"  Input: {mesh.n_verts} verts, {mesh.n_faces} faces")
@@ -38,14 +39,21 @@ def main():
 
     for target in targets:
         t0 = time.time()
-        simplified = simplify_qem(mesh, target_verts=target, use_optimal_position=True)
+        simplified = simplify_qem(
+            mesh,
+            target_verts=target,
+            use_optimal_position=True,
+            use_line_quadric=args.use_line_quadrics,
+        )
         dt = time.time() - t0
         areas = face_areas(simplified)
         min_area = areas.min()
         mean_area = areas.mean()
         results.append((target, simplified, dt, min_area, mean_area))
         print(f"\n  Target {target} verts:")
-        print(f"    Result: {simplified.n_verts} verts, {simplified.n_faces} faces")
+        print(
+            f"    Result: {simplified.n_verts} verts, {simplified.n_faces} faces"
+        )
         print(f"    Time: {dt:.2f}s")
         print(f"    Face areas: min={min_area:.6f}, mean={mean_area:.6f}")
 
@@ -57,7 +65,9 @@ def main():
             assert min_area > 0, f"Degenerate face at target={target}"
             f = simplified.faces
             assert not np.any(
-                (f[:, 0] == f[:, 1]) | (f[:, 1] == f[:, 2]) | (f[:, 0] == f[:, 2])
+                (f[:, 0] == f[:, 1])
+                | (f[:, 1] == f[:, 2])
+                | (f[:, 0] == f[:, 2])
             )
         assert results[-1][2] < 5.0, "Too slow (>5s for 200 verts target)"
         print("SMOKE: PASS")
@@ -80,7 +90,7 @@ def main():
         # Show simplified versions side by side
         for i, (target, simplified, _, _, _) in enumerate(results):
             verts = simplified.vertices.copy()
-            verts[:, 0] += (i + 1) * 2.0
+            verts[:, 0] += (i + 1) * 2.1
             ps.register_surface_mesh(
                 f"QEM {target}v",
                 verts,

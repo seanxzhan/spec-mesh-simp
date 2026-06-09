@@ -48,6 +48,41 @@ class Quadric:
         return cls(A, b, c)
 
     @classmethod
+    def from_line(cls, point: np.ndarray, normal: np.ndarray, face_areas: list[float], weight: float = 1e-3) -> Quadric:
+        """Line quadric that penalizes movement away from the vertex normal direction.
+
+        Constrains the vertex to stay on the line defined by its position and normal.
+        This preserves sharp features by penalizing tangential drift.
+
+        Args:
+            point: Vertex position
+            normal: Area-weighted vertex normal (will be normalized internally)
+            face_areas: Areas of incident faces (used for weighting)
+            weight: Regularization weight
+        """
+        n_len = np.linalg.norm(normal)
+        if n_len < 1e-12:
+            total_area = np.sum(face_areas) / 3.0
+            return cls.from_point(point, weight * total_area)
+
+        u1 = normal / n_len
+
+        # Build orthonormal basis perpendicular to u1
+        e1 = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(u1, e1)) > 0.9:
+            e1 = np.array([0.0, 1.0, 0.0])
+        u2 = e1 - np.dot(u1, e1) * u1
+        u2 = u2 / np.linalg.norm(u2)
+        u3 = np.cross(u1, u2)
+
+        # Line quadric = sum of two plane quadrics perpendicular to the line
+        q2 = cls.from_plane(u2, point)
+        q3 = cls.from_plane(u3, point)
+        line_q = q2 + q3
+        scale = weight * np.sum(face_areas) / 3.0
+        return line_q * scale
+
+    @classmethod
     def vertex_quadric(cls, face_quadrics: list[Quadric], face_areas: list[float]) -> Quadric:
         """Area-weighted sum of face quadrics for a vertex."""
         result = cls()

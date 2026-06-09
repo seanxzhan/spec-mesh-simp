@@ -12,6 +12,8 @@ def simplify_qem(
     mesh: TriMesh,
     target_verts: int,
     use_optimal_position: bool = True,
+    use_line_quadric: bool = True,
+    line_quadric_weight: float = 1e-3,
     verbose: bool = False,
 ) -> TriMesh:
     """Simplify a mesh using Quadric Error Metrics (Garland & Heckbert 1997).
@@ -37,12 +39,22 @@ def simplify_qem(
             adj.vertices[a], adj.vertices[b], adj.vertices[c]
         )
 
-    # Compute vertex quadrics (area-weighted sum of incident face quadrics)
+    # Compute vertex quadrics (area-weighted sum of incident face quadrics + line quadric)
     vertex_quadrics: dict[int, Quadric] = {}
     for vi in range(mesh.n_verts):
         fq = [face_quadrics[fi] for fi in adj.vert_faces[vi]]
         fa = [areas[fi] for fi in adj.vert_faces[vi]]
         vertex_quadrics[vi] = Quadric.vertex_quadric(fq, fa)
+
+        if use_line_quadric:
+            # Compute area-weighted vertex normal
+            vertex_normal = np.zeros(3)
+            for fi in adj.vert_faces[vi]:
+                a, b, c = adj.get_face_vertices(fi)
+                n = np.cross(adj.vertices[b] - adj.vertices[a], adj.vertices[c] - adj.vertices[a])
+                vertex_normal += n  # already area-weighted (cross product magnitude ~ 2*area)
+            line_q = Quadric.from_line(adj.vertices[vi], vertex_normal, fa, line_quadric_weight)
+            vertex_quadrics[vi] += line_q
 
     # Timestamp-based stale detection
     vertex_timestamps: dict[int, int] = {v: 0 for v in range(mesh.n_verts)}
