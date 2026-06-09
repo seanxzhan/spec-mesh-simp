@@ -1,0 +1,41 @@
+import numpy as np
+from specsimp.mesh import make_icosphere, load_obj, face_areas
+from specsimp.simplify_qem import simplify_qem
+
+
+def test_reaches_target():
+    mesh = make_icosphere(2)  # 162 verts
+    result = simplify_qem(mesh, target_verts=50)
+    assert result.n_verts == 50
+
+
+def test_output_manifold():
+    mesh = make_icosphere(2)
+    result = simplify_qem(mesh, target_verts=50)
+    f = result.faces
+    assert np.all(f >= 0)
+    assert np.all(f < result.n_verts)
+    assert not np.any((f[:, 0] == f[:, 1]) | (f[:, 1] == f[:, 2]) | (f[:, 0] == f[:, 2]))
+
+
+def test_no_optimal_position():
+    mesh = make_icosphere(2)
+    result = simplify_qem(mesh, target_verts=80, use_optimal_position=False)
+    assert result.n_verts == 80
+
+
+def test_spot_obj():
+    mesh = load_obj("data/spot.obj")
+    result = simplify_qem(mesh, target_verts=500)
+    assert result.n_verts == 500
+    # Should still have positive face areas (no degenerate triangles)
+    areas = face_areas(result)
+    assert np.all(areas > 0)
+
+
+def test_deterministic():
+    mesh = make_icosphere(2)
+    r1 = simplify_qem(mesh, target_verts=80)
+    r2 = simplify_qem(mesh, target_verts=80)
+    np.testing.assert_array_equal(r1.vertices, r2.vertices)
+    np.testing.assert_array_equal(r1.faces, r2.faces)
