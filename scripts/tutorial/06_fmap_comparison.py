@@ -68,7 +68,7 @@ def main():
 
     # Spectral simplification
     t0 = time.time()
-    mesh_spec, P_spec = simplify_spectral(mesh, target_verts=target, k=K, use_quadratic_fit=False, verbose=True)
+    mesh_spec, P_spec = simplify_spectral(mesh, target_verts=target, k=K, use_quadratic_fit=True, verbose=True)
     dt_spec = time.time() - t0
     L_spec, M_spec = cotangent_laplacian(mesh_spec)
     vals_spec, vecs_spec = compute_eigenpairs(L_spec, M_spec, k=K)
