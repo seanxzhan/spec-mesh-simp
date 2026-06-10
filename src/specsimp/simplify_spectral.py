@@ -24,7 +24,7 @@ def simplify_spectral(
     mesh: TriMesh,
     target_verts: int,
     k: int = 30,
-    use_quadratic_fit: bool = False,
+    use_quadratic_fit: bool = True,
     verbose: bool = False,
 ) -> tuple[TriMesh, sparse.csc_matrix]:
     """Spectrum-preserving mesh simplification.
