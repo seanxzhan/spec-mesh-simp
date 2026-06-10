@@ -28,8 +28,8 @@ fi
 
 # Derive names from input
 BASENAME=$(basename "$INPUT" .obj)
-SPEC_OUT="out/${BASENAME}_spec_simp_${TARGET}.obj"
-QEM_OUT="out/${BASENAME}_qem_simp_${TARGET}.obj"
+SPEC_OUT="out/simp_spec_${BASENAME}_${TARGET}.obj"
+QEM_OUT="out/simp_qem_${BASENAME}_${TARGET}.obj"
 P_SPEC="out/P_spectral_${BASENAME}_${TARGET}.mtx"
 P_QEM="out/P_qem_${BASENAME}_${TARGET}.mtx"
 FMAP_PNG="out/fmap_${BASENAME}_${TARGET}.png"
